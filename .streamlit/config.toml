@@ -1,0 +1,5 @@
+[server]
+maxUploadSize = 2048        # MB, so long CCTV clips can be uploaded from the dashboard
+
+[browser]
+gatherUsageStats = false

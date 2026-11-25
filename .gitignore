@@ -12,6 +12,7 @@ env/
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
 
 # Video/Image evidence output folders
 recordings/
@@ -19,6 +20,14 @@ snapshots/
 alerts_videos/
 alerts_snapshots/
 reports/
+
+# Recorded demo footage (large)
+demo_footage/
+
+# Biometric data (face templates) and live telemetry
+known_faces/
+telemetry.json
+telemetry.json.tmp
 
 # AI Model weights
 *.pt

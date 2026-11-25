@@ -22,13 +22,15 @@ def print_banner():
     print("  [4] Run Crowd Gathering Module (crowd_detection.py)")
     print("  [5] Run Abandoned Luggage Detection (abandoned_bag.py)")
     print("  [6] Check / Reset SQLite Database (safesight.db)")
+    print("  [7] Analyze Recorded CCTV Footage (demo mode)")
+    print("  [8] Record Demo Footage from Webcam")
     print("  [0] Exit")
     print("-" * 65)
 
 def main():
     while True:
         print_banner()
-        choice = input("Enter option [0-6]: ").strip()
+        choice = input("Enter option [0-8]: ").strip()
 
         if choice == "1":
             print("\nStarting SafeSight Vision Engine...")
@@ -52,11 +54,45 @@ def main():
                 print(f"\nDatabase status: Active ({size_kb:.2f} KB)")
                 confirm = input("Would you like to clear historical records? (y/n): ").strip().lower()
                 if confirm == "y":
-                    os.remove(db_file)
-                    print("Database reset successfully.")
+                    import sqlite3
+                    try:
+                        conn = sqlite3.connect(db_file, timeout=10)
+                        conn.execute("DELETE FROM security_events")
+                        conn.execute("DELETE FROM sqlite_sequence WHERE name='security_events'")
+                        conn.commit()
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        conn.close()
+                        print("Incident records cleared (user accounts kept; ledger restarts at genesis).")
+                    except sqlite3.Error as e:
+                        print(f"Could not clear records: {e}")
             else:
                 print("\nDatabase file not created yet.")
             input("\nPress Enter to return to menu...")
+        elif choice == "7":
+            path = ""
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                path = filedialog.askopenfilename(
+                    title="Select CCTV footage",
+                    initialdir="demo_footage" if os.path.isdir("demo_footage") else ".",
+                    filetypes=[("Video files", "*.mp4 *.avi *.mkv *.mov *.wmv"), ("All files", "*.*")])
+                root.destroy()
+            except Exception:
+                pass
+            if not path:
+                path = input("\nPath to video file (blank to cancel): ").strip().strip('"')
+            if path:
+                cmd = [sys.executable, "backend/safesight.py", "--video", path]
+                if input("Analyse EVERY frame (slower, most accurate)? (y/n): ").strip().lower() == "y":
+                    cmd.append("--every-frame")
+                print("\nStarting footage analysis. Open the dashboard (option 2) to watch it live.")
+                subprocess.run(cmd)
+        elif choice == "8":
+            subprocess.run([sys.executable, "backend/record_demo.py"])
         elif choice == "0":
             print("\nExiting SafeSight. Goodbye!")
             break

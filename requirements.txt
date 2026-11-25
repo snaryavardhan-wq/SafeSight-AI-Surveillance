@@ -1,0 +1,12 @@
+ultralytics
+lapx            # required by ByteTrack
+opencv-python>=4.10,<5   # 5.x removed the face-detection classes
+numpy
+scipy           # needed by SafeSight's tracker fallback (and by Ultralytics tools)
+pandas>=2.2,<3          # 3.x binaries are blocked by some Windows policies
+streamlit>=1.60
+pillow
+reportlab
+requests
+pyttsx3
+imageio-ffmpeg  # optional: lets mp4v clips be re-encoded to browser-playable H.264

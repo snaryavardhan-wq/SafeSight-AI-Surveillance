@@ -1,6 +1,9 @@
 import os
 import sqlite3
 import hashlib
+import config
+import database
+from reportlab.lib.utils import ImageReader
 from datetime import datetime
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import (
@@ -15,9 +18,16 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
-DB_PATH = "safesight.db"
+DB_PATH = config.DB_PATH
 REPORTS_DIR = "reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
+
+
+def _fit_image(path, max_w, max_h):
+    """Keep the evidence photo's true aspect ratio (the old code stretched it)."""
+    iw, ih = ImageReader(path).getSize()
+    scale = min(max_w / iw, max_h / ih)
+    return RLImage(path, width=iw * scale, height=ih * scale)
 
 def generate_pdf_dossier():
     """Compiles an immutable legal forensic evidence dossier with photographic proofs and SHA-256 hash."""
@@ -27,7 +37,7 @@ def generate_pdf_dossier():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, timestamp, event_type, threat_level, threat_score, details, snapshot_path, video_path
+        SELECT id, timestamp, event_type, threat_level, threat_score, details, snapshot_path, video_path, content_hash, chain_hash
         FROM security_events
         ORDER BY id DESC
         LIMIT 8
@@ -88,7 +98,7 @@ def generate_pdf_dossier():
     )
 
     # 1. Official Header
-    story.append(Paragraph("🛡️ SAFESIGHT AUTONOMOUS SECURITY OPERATIONS CENTER", header_title_style))
+    story.append(Paragraph("SAFESIGHT AUTONOMOUS SECURITY OPERATIONS CENTER", header_title_style))
     story.append(Paragraph("COURTROOM-READY FORENSIC INCIDENT EVIDENCE DOSSIER", sub_title_style))
     story.append(Spacer(1, 4))
     story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#0284C7"), spaceAfter=10))
@@ -161,7 +171,7 @@ def generate_pdf_dossier():
                     Paragraph(f"<b>EVIDENCE LOG #{p_id}:</b> {p_type} [{p_sev}]<br/><b>Timestamp:</b> {p_time}<br/><b>Telemetry:</b> {p_details}", body_text_style),
                 ],
                 [
-                    RLImage(p_path, width=260, height=140)
+                    _fit_image(p_path, 260, 160)
                 ]
             ]
             t_photo = Table(photo_box, colWidths=[540])
@@ -176,15 +186,30 @@ def generate_pdf_dossier():
     else:
         story.append(Paragraph("<i>No photographic snapshot evidence currently recorded on disk.</i>", body_text_style))
 
-    # 4. SHA-256 Digital Cryptographic Signature
-    raw_hash_seed = f"SafeSight_SOC_{timestamp_str}_{len(events)}_{events[0][0] if events else '0'}"
-    sha256_digital_signature = hashlib.sha256(raw_hash_seed.encode("utf-8")).hexdigest().upper()
-
+    # 4. Hash-chained ledger seals + verification status
+    report = database.verify_ledger()
+    sealed = [ev for ev in reversed(events) if ev[9]]          # oldest -> newest
     story.append(Spacer(1, 10))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#CBD5E1"), spaceAfter=8))
-    story.append(Paragraph("<b>IMMUTABLE SHA-256 CRYPTOGRAPHIC PROOF OF AUTHENTICITY</b>", sub_title_style))
-    story.append(Paragraph(f"DIGITAL CHECKSUM: {sha256_digital_signature}", hash_style))
-    story.append(Paragraph("<i>Notice: This automated report constitutes non-repudiable evidentiary proof generated autonomously by the SafeSight AI SOC node.</i>", body_text_style))
+    story.append(Paragraph("<b>SECTION III: HASH-CHAINED LEDGER SEALS (SHA-256)</b>", styles['Heading2']))
+    status = ("VERIFIED: all sealed records, snapshots and clips match their digests" if report["ok"]
+              else f"FAILED: {len(report['problems'])} integrity problem(s) detected, see dashboard")
+    story.append(Paragraph(f"<b>Ledger verification at generation time:</b> {status}", body_text_style))
+    story.append(Spacer(1, 4))
+    for ev in sealed:
+        story.append(Paragraph(f"EVENT #{ev[0]}<br/>content = SHA256(snapshot|time|score|event): {ev[8]}<br/>chain   = {ev[9]}", hash_style))
+        story.append(Spacer(1, 3))
+    if not sealed:
+        story.append(Paragraph("<i>No sealed (hash-chained) records in this report; legacy rows are unsealed.</i>", body_text_style))
+    digest = hashlib.sha256("".join(ev[9] for ev in sealed).encode("utf-8")).hexdigest().upper() if sealed else "N/A"
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("<b>REPORT DIGEST (SHA-256 over the listed chain seals):</b>", sub_title_style))
+    story.append(Paragraph(digest, hash_style))
+    story.append(Paragraph(f"<b>LEDGER HEAD:</b> {report['head']}", hash_style))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph("<i>Notice: SHA-256 sealing makes any later alteration or deletion of these records tamper-EVIDENT. "
+                           "It does not by itself prevent an administrator with database access from rewriting history; "
+                           "compare the ledger head with the copy sent to the security channel.</i>", body_text_style))
 
     # Build PDF
     doc.build(story)

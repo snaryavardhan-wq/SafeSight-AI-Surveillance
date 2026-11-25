@@ -4,17 +4,33 @@ import sqlite3
 import hashlib
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 from datetime import datetime, date
+import re
+import json
+import time
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
 
+import config
+import database
+
 try:
     from pdf_report_generator import generate_pdf_dossier
 except Exception:
     generate_pdf_dossier = None
+
+
+@st.cache_resource
+def _boot_db():
+    database.init_db()      # creates every table (incl. users) and enables WAL: no more login crash
+    return True
+
+
+_boot_db()
 
 st.set_page_config(
     page_title="SafeSight AI | Tactical SOC",
@@ -23,7 +39,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"  # Forces the sidebar to stay open
 )
 
-DB_PATH = "safesight.db"
+DB_PATH = config.DB_PATH
 SNAPSHOT_DIR = "alerts_snapshots"
 VIDEO_DIR = "alerts_videos"
 REPORTS_DIR = "reports"
@@ -286,10 +302,12 @@ if not st.session_state["authenticated"]:
                 <p style="color:#64748B; font-size:0.85rem;">Autonomous Edge AI Surveillance Operations</p>
             </div>
         """, unsafe_allow_html=True)
+        if not database.has_users():
+            st.warning("No accounts exist yet. Run `python backend/setup_users.py` once, then refresh.")
         with st.form("login_form"):
             user_in = st.text_input("Security Identifier")
             pass_in = st.text_input("Access Key", type="password")
-            if st.form_submit_button("Authenticate Access", use_container_width=True):
+            if st.form_submit_button("Authenticate Access", width="stretch"):
                 u_info = verify_user(user_in.strip(), pass_in.strip())
                 if u_info:
                     st.session_state["authenticated"] = True
@@ -314,7 +332,7 @@ with st.sidebar:
         </div>
     """, unsafe_allow_html=True)
 
-    if st.button("🚪 Sign Out", use_container_width=True):
+    if st.button("🚪 Sign Out", width="stretch"):
         st.session_state["authenticated"] = False
         st.session_state["user"] = None
         st.rerun()
@@ -339,7 +357,7 @@ with st.sidebar:
         st.markdown("##### 🔒 Master Maintenance")
         with st.expander("⚡ Purge Incident Logs"):
             confirm = st.text_input("Type 'CONFIRM'", type="password")
-            if st.button("🚨 Purge Database", use_container_width=True) and confirm == "CONFIRM":
+            if st.button("🚨 Purge Database", width="stretch") and confirm == "CONFIRM":
                 conn = sqlite3.connect(DB_PATH)
                 conn.cursor().execute("DELETE FROM security_events")
                 conn.commit()
@@ -347,7 +365,278 @@ with st.sidebar:
                 st.toast("Security logs purged by Administrator.", icon="🗑️")
                 st.rerun()
 
+def _load_telemetry():
+    try:
+        with open(config.TELEMETRY_PATH, "r", encoding="utf-8") as f:
+            t = json.load(f)
+        t["age"] = time.time() - t.get("ts", 0)
+        return t
+    except Exception:
+        return None
+
+
 @st.fragment(run_every="2s")
+def live_telemetry_panel():
+    """Live engine telemetry (FPS, tracks, threat gauge). Only this small fragment refreshes."""
+    t = _load_telemetry()
+    online = t is not None and t["age"] < 5
+    colors = {"NORMAL": "#10B981", "CAUTION": "#38BDF8", "HIGH": "#F59E0B", "CRITICAL": "#EF4444"}
+    if not online:
+        st.markdown('<div class="kpi-box kpi-red"><div class="kpi-label">SENTRY ENGINE</div>'
+                    '<div class="kpi-num" style="color:#F87171;">OFFLINE</div></div>', unsafe_allow_html=True)
+        return
+    lvl, score = t["level"], t["score"]
+    c = st.columns(6)
+    items = [("ENGINE", "ONLINE" if t["camera_connected"] else "NO CAMERA", "kpi-emerald" if t["camera_connected"] else "kpi-red"),
+             ("LIVE FPS", f'{t["fps"]:.0f}', "kpi-cyan"),
+             ("PEOPLE / BAGS", f'{t["persons"]} / {t["bags"]}', "kpi-purple"),
+             ("THREAT", f"{lvl} {score}", "kpi-red" if lvl in ("HIGH", "CRITICAL") else "kpi-amber"),
+             ("RAM BUFFER", f'{t["buffer"]}/{t["buffer_cap"]}', "kpi-cyan"),
+             ("EVIDENCE QUEUE", str(t["pending_evidence"]), "kpi-amber")]
+    for col, (lab, val, cls) in zip(c, items):
+        col.markdown(f'<div class="kpi-box {cls}"><div class="kpi-label">{lab}</div><div class="kpi-num">{val}</div></div>',
+                     unsafe_allow_html=True)
+    st.markdown(f"""
+        <div style="margin:10px 0 4px 0;background:#0B1120;border:1px solid rgba(148,163,184,.12);border-radius:8px;height:14px;">
+            <div style="width:{max(score, 2)}%;height:100%;border-radius:8px;background:{colors.get(lvl, '#10B981')};"></div>
+        </div>
+        <div style="font-family:'JetBrains Mono';font-size:.72rem;color:#64748B;">
+            Threat gauge {score}/100 | {' | '.join(t['reasons']) if t['reasons'] else 'no active anomalies'}
+        </div>""", unsafe_allow_html=True)
+    if t.get("source_type") == "file":
+        pos, dur = t.get("position") or 0, t.get("duration") or 0
+        pct = min(100, int(100 * pos / dur)) if dur else 0
+        state = "ANALYSIS COMPLETE" if t.get("complete") else ("PAUSED" if t.get("paused") else "ANALYZING")
+        mm = lambda x: f"{int(x) // 60:02d}:{int(x) % 60:02d}"
+        st.markdown(f"""
+            <div style="margin-top:10px;font-family:'JetBrains Mono';font-size:.75rem;color:#38BDF8;">
+                🎞️ {state}: {t.get('source')} | {mm(pos)} / {mm(dur)} | {t.get('run_events', 0)} incident(s) this run | {t.get('analysis_mode')} mode
+            </div>
+            <div style="margin-top:4px;background:#0B1120;border:1px solid rgba(148,163,184,.12);border-radius:8px;height:8px;">
+                <div style="width:{max(pct, 1)}%;height:100%;border-radius:8px;background:#38BDF8;"></div>
+            </div>""", unsafe_allow_html=True)
+
+
+@st.fragment(run_every="3s")
+def new_event_watcher():
+    """Reruns the whole page only when a NEW incident is recorded, so video playback isn't interrupted."""
+    latest = database.latest_event_id()
+    seen = st.session_state.get("seen_event_id")
+    if seen is None:
+        st.session_state["seen_event_id"] = latest
+    elif latest != seen:
+        st.session_state["seen_event_id"] = latest
+        st.rerun(scope="app")
+
+
+_STREAM_HTML = """
+<style>
+  body{margin:0;background:transparent;font-family:'Segoe UI',Arial,sans-serif}
+  .wrap{background:#06080F;border:1px solid rgba(56,189,248,.25);border-radius:10px;padding:8px}
+  .bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center}
+  button{background:#0B1120;color:#E2E8F0;border:1px solid rgba(148,163,184,.3);border-radius:6px;
+         padding:5px 10px;font-size:12px;cursor:pointer}
+  button:hover{border-color:#38BDF8}
+  .hint{color:#94A3B8;font-size:12px}
+  .stage{position:relative}
+  #v{width:100%;display:block;border-radius:6px;background:#000;max-height:500px;object-fit:contain}
+  #c{position:absolute;left:0;top:0;pointer-events:none}
+</style>
+<div class="wrap">
+  <div class="bar">
+    <button id="draw">✏️ Draw zone</button>
+    <button id="undo" style="display:none">↶ Undo point</button>
+    <button id="finish" style="display:none">✔ Finish zone</button>
+    <button id="clear">🗑 Clear zone</button>
+    <span id="fbar" style="display:none;gap:8px">
+      <button id="play">⏯ Play / Pause</button> <button id="restart">⟲ Restart</button>
+    </span>
+    <span class="hint" id="hint"></span>
+  </div>
+  <div class="stage"><img id="v" alt="live view"/><canvas id="c"></canvas></div>
+</div>
+<script>
+(function() {
+  var host = 'localhost';
+  try { host = window.parent.location.hostname || host; } catch (e) {}
+  var BASE = 'http://' + host + ':__PORT__', T = '__TOKEN__';
+  var img = document.getElementById('v'), cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  var hint = document.getElementById('hint'), drawing = false, pts = [];
+  if (__IS_FILE__) document.getElementById('fbar').style.display = 'inline-flex';
+  img.src = BASE + '/stream.mjpg?t=' + T;
+
+  function vrect() {                       // where the video really is inside the <img> (object-fit: contain)
+    var r = img.getBoundingClientRect(), nw = img.naturalWidth || 16, nh = img.naturalHeight || 9;
+    var sc = Math.min(r.width / nw, r.height / nh), w = nw * sc, h = nh * sc;
+    return {x: (r.width - w) / 2, y: (r.height - h) / 2, w: w, h: h, W: r.width, H: r.height};
+  }
+  function redraw() {
+    var v = vrect(); cv.width = v.W; cv.height = v.H; ctx.clearRect(0, 0, v.W, v.H);
+    if (!pts.length) return;
+    ctx.strokeStyle = '#38BDF8'; ctx.fillStyle = '#38BDF8'; ctx.lineWidth = 2; ctx.beginPath();
+    pts.forEach(function(p, i) { var x = v.x + p[0] * v.w, y = v.y + p[1] * v.h; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke();
+    pts.forEach(function(p) { ctx.beginPath(); ctx.arc(v.x + p[0] * v.w, v.y + p[1] * v.h, 4, 0, 6.3); ctx.fill(); });
+  }
+  function ui() {
+    ['undo', 'finish'].forEach(function(id) { document.getElementById(id).style.display = drawing ? 'inline-block' : 'none'; });
+    hint.textContent = drawing ? 'Click on the video to place corners (' + pts.length + ' so far, need 3+), then Finish zone.' : '';
+    redraw();
+  }
+  function send(cmd) {
+    return fetch(BASE + '/command?t=' + T, {method: 'POST', mode: 'no-cors',
+                 headers: {'Content-Type': 'text/plain'}, body: JSON.stringify(cmd)});
+  }
+  img.addEventListener('click', function(e) {
+    if (!drawing) return;
+    var r = img.getBoundingClientRect(), v = vrect();
+    var x = (e.clientX - r.left - v.x) / v.w, y = (e.clientY - r.top - v.y) / v.h;
+    if (x < 0 || y < 0 || x > 1 || y > 1) return;
+    pts.push([x, y]); ui();
+  });
+  document.getElementById('draw').onclick = function() { drawing = true; pts = []; ui(); };
+  document.getElementById('undo').onclick = function() { pts.pop(); ui(); };
+  document.getElementById('finish').onclick = function() {
+    if (pts.length < 3) { hint.textContent = 'A zone needs at least 3 corners.'; return; }
+    send({cmd: 'zone', points: pts}); drawing = false; pts = []; ui(); hint.textContent = 'Zone applied.';
+  };
+  document.getElementById('clear').onclick = function() { send({cmd: 'zone_clear'}); drawing = false; pts = []; ui(); hint.textContent = 'Zone cleared.'; };
+  document.getElementById('play').onclick = function() { send({cmd: 'toggle_pause'}); };
+  document.getElementById('restart').onclick = function() { send({cmd: 'restart'}); };
+  setInterval(redraw, 500); window.addEventListener('resize', redraw);
+})();
+</script>
+"""
+
+
+def _stream_html(port, token, is_file):
+    return (_STREAM_HTML.replace("__PORT__", str(int(port))).replace("__TOKEN__", re.sub(r"[^A-Za-z0-9_-]", "", str(token)))
+            .replace("__IS_FILE__", "true" if is_file else "false"))
+
+
+@st.fragment(run_every="3s")
+def live_camera_panel():
+    """Live annotated video from the engine (in-memory MJPEG stream, nothing is written to disk)."""
+    t = _load_telemetry()
+    online = t is not None and t["age"] < 5
+    stream = t.get("stream") if online else None
+    with st.expander("📺 Live Camera View", expanded=True):
+        if not stream:
+            st.info("The live view appears here while the sentry engine is running (streaming on, "
+                    "dashboard and engine on the same PC unless SAFESIGHT_STREAM_HOST is set).")
+            return
+        src = f"recorded footage {t.get('source')}" if t.get("source_type") == "file" else "live camera"
+        st.caption(f"Source: {src}. Use Draw zone to mark the restricted area directly on the video.")
+        html = _stream_html(stream["port"], stream["token"], t.get("source_type") == "file").strip()
+        if hasattr(st, "iframe"):
+            st.iframe(html, height=600)            # replaces the deprecated components.html
+        else:
+            components.html(html, height=600)
+
+
+ALLOWED_VIDEO_EXT = tuple(config.VIDEO_EXTENSIONS)
+
+
+def _save_upload(uploaded):
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", uploaded.name)
+    base, ext = os.path.splitext(name)
+    if ext.lower() not in ALLOWED_VIDEO_EXT:
+        raise ValueError("Unsupported video type. Use .mp4, .avi, .mov, .mkv or .wmv")
+    os.makedirs(config.FOOTAGE_DIR, exist_ok=True)
+    path = os.path.abspath(os.path.join(config.FOOTAGE_DIR, f"{time.strftime('%Y%m%d_%H%M%S')}_{base}{ext.lower()}"))
+    with open(path, "wb") as f:
+        f.write(uploaded.getbuffer())
+    return path
+
+
+@st.fragment(run_every="2s")
+def source_status_line():
+    t = _load_telemetry()
+    if t is None or t["age"] >= 5:
+        st.markdown('<span class="status-pill" style="color:#F87171;border-color:rgba(239,68,68,.4);">'
+                    'ENGINE OFFLINE: start it with run_safesight.bat</span>', unsafe_allow_html=True)
+        return
+    kind, label = t.get("source_kind", "webcam"), t.get("source", "")
+    text = {"webcam": "WEBCAM", "cctv": f"CCTV {label}", "file": f"RECORDED VIDEO {label}"}.get(kind, label)
+    st.markdown(f'<span class="status-pill">CURRENT: {text}</span>', unsafe_allow_html=True)
+    stt = t.get("source_status") or {}
+    if stt.get("state") == "connecting":
+        st.info(stt.get("message", "Connecting..."))
+    elif stt.get("state") == "error":
+        st.error(stt.get("message", "Could not switch source."))
+
+
+def _engine_online():
+    t = _load_telemetry()
+    return t is not None and t["age"] < 5
+
+
+def render_camera_source_panel():
+    st.markdown("""
+        <div class="soc-nav" style="margin-bottom:8px;">
+            <div>
+                <div style="font-size:1.05rem;font-weight:700;color:#F8FAFC;">Camera Source</div>
+                <div class="soc-subtitle-text">Choose what SafeSight should analyze</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+    source_status_line()
+    if not is_admin:
+        st.caption("Only administrators can change the camera source.")
+        return
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([1.1, 3.4, 1.3])
+        use_webcam = c1.button("💻 Webcam", width="stretch")
+        cctv_url = c2.text_input("CCTV / RTSP address", type="password", key="cctv_url",
+                                 placeholder="rtsp://username:password@camera-ip:554/stream",
+                                 label_visibility="collapsed")
+        use_cctv = c3.button("📹 Connect CCTV", width="stretch")
+
+        d1, d2 = st.columns([3.6, 1.2])
+        uploaded = d1.file_uploader("Upload a recorded video", type=[e.lstrip(".") for e in ALLOWED_VIDEO_EXT],
+                                    key="video_upload", label_visibility="collapsed")
+        use_upload = d2.button("🎞️ Use Recorded Video", width="stretch")
+
+        e1, e2 = st.columns([3.6, 1.2])
+        existing = sorted((f for f in os.listdir(config.FOOTAGE_DIR) if f.lower().endswith(ALLOWED_VIDEO_EXT)),
+                          reverse=True) if os.path.isdir(config.FOOTAGE_DIR) else []
+        picked = e1.selectbox("Or pick a video already on this PC", ["(none)"] + existing, key="video_pick",
+                              label_visibility="collapsed")
+        use_picked = e2.button("▶ Use selected", width="stretch")
+        o1, o2 = st.columns(2)
+        mode = o1.radio("Playback", ["Real-time", "Every frame (accurate, slower)"], horizontal=True, key="play_mode")
+        loop = o2.checkbox("Loop the video", key="play_loop")
+
+    req = None
+    try:
+        if use_webcam:
+            req = {"type": "webcam"}
+        elif use_cctv:
+            if not cctv_url.strip():
+                st.warning("Type the camera address first.")
+            else:
+                req = {"type": "cctv", "value": cctv_url.strip()}
+        elif use_upload:
+            if uploaded is None:
+                st.warning("Choose a video file first.")
+            else:
+                req = {"type": "file", "value": _save_upload(uploaded)}
+        elif use_picked:
+            if picked == "(none)":
+                st.warning("Pick a video from the list.")
+            else:
+                req = {"type": "file", "value": os.path.abspath(os.path.join(config.FOOTAGE_DIR, picked))}
+    except ValueError as e:
+        st.error(str(e))
+    if req:
+        if not _engine_online():
+            st.error("The sentry engine is not running. Start it first (run_safesight.bat), then try again.")
+        else:
+            if req["type"] == "file":
+                req.update(every_frame=mode.startswith("Every"), loop=bool(loop))
+            database.post_source_request(req)
+            st.toast("Switching source...", icon="🔄")
+
+
 def render_soc_interface():
     df = fetch_security_logs()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -370,6 +659,11 @@ def render_soc_interface():
             </div>
         </div>
     """, unsafe_allow_html=True)
+
+    live_telemetry_panel()
+    render_camera_source_panel()
+    live_camera_panel()
+    new_event_watcher()
 
     if is_admin:
         tab_live, tab_export, tab_users = st.tabs([
@@ -433,7 +727,7 @@ def render_soc_interface():
                             data=video_bytes,
                             file_name=os.path.basename(v_path),
                             mime="video/mp4",
-                            use_container_width=True
+                            width="stretch"
                         )
                     else:
                         st.info("⚠️ Video buffer clip was not recorded for this event.")
@@ -443,14 +737,14 @@ def render_soc_interface():
                     s_path = str(active_record["snapshot_path"]) if pd.notna(active_record["snapshot_path"]) else ""
                     if s_path and os.path.exists(s_path):
                         img = Image.open(s_path)
-                        st.image(img, use_container_width=True)
+                        st.image(img, width="stretch")
                         with open(s_path, "rb") as sf:
                             st.download_button(
                                 label=f"⬇️ Download Event #{active_record['id']} JPEG Snapshot",
                                 data=sf.read(),
                                 file_name=os.path.basename(s_path),
                                 mime="image/jpeg",
-                                use_container_width=True
+                                width="stretch"
                             )
                         st.markdown(f"""
                             <div style="margin-top:6px;">
@@ -459,6 +753,11 @@ def render_soc_interface():
                                 <div style="font-size:0.8rem; color:#E2E8F0; margin-top:4px;"><b>Telemetry:</b> {active_record['details']}</div>
                             </div>
                         """, unsafe_allow_html=True)
+                        seal = active_record.get("chain_hash")
+                        if seal is not None and pd.notna(seal) and str(seal):
+                            st.caption(f"🔐 Ledger seal (SHA-256 chain): {str(seal)[:32]}…")
+                        else:
+                            st.caption("⚠️ Legacy record: not sealed in the hash-chained ledger.")
                     else:
                         st.caption("No snapshot recorded for this entry.")
             else:
@@ -479,13 +778,26 @@ def render_soc_interface():
                         "details": "Telemetry Details"
                     }
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
     # TAB 2: EXPORT
     if is_admin:
         with tab_export:
+            st.markdown("#### 🔐 Ledger Integrity Verification")
+            st.caption("Recomputes every SHA-256 digest from the stored snapshots and clips and checks the hash chain for deleted or altered records.")
+            if st.button("🔍 Verify Ledger Integrity", width="stretch"):
+                rep_ = database.verify_ledger()
+                if rep_["ok"]:
+                    st.success(f"Ledger intact: {rep_['sealed']} sealed record(s) verified"
+                               + (f", {rep_['legacy']} legacy unsealed." if rep_["legacy"] else "."))
+                else:
+                    st.error(f"INTEGRITY FAILURE: {len(rep_['problems'])} problem(s) detected")
+                    for p in rep_["problems"]:
+                        st.write(f"• Event #{p['id']}: {p['issue']}")
+                st.code(f"Chain head: {rep_['head']}")
+            st.divider()
             st.markdown("#### 📥 Official Forensic Evidentiary Proofs")
             st.write("Generate and download legal proof dossiers containing cryptographic signatures, photo logs, and incident telemetry:")
             
@@ -494,7 +806,7 @@ def render_soc_interface():
                 st.markdown("##### 📄 Courtroom Forensic PDF Dossier")
                 st.caption("Compiles recent security breach photos, timestamps, telemetry details, and a SHA-256 digital signature into a PDF.")
                 if generate_pdf_dossier is not None:
-                    if st.button("⚡ Generate Legal PDF Dossier", use_container_width=True):
+                    if st.button("⚡ Generate Legal PDF Dossier", width="stretch"):
                         pdf_file = generate_pdf_dossier()
                         if pdf_file and os.path.exists(pdf_file):
                             with open(pdf_file, "rb") as f:
@@ -503,7 +815,7 @@ def render_soc_interface():
                                     data=f.read(),
                                     file_name=os.path.basename(pdf_file),
                                     mime="application/pdf",
-                                    use_container_width=True
+                                    width="stretch"
                                 )
                             st.success(f"Dossier ready: {os.path.basename(pdf_file)}")
                         else:
@@ -520,7 +832,7 @@ def render_soc_interface():
                         data=df.to_csv(index=False).encode('utf-8'),
                         file_name=f"SafeSight_Full_Audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv",
-                        use_container_width=True
+                        width="stretch"
                     )
                 else:
                     st.info("No security logs available for export yet.")
@@ -563,10 +875,10 @@ def render_soc_interface():
             u1, u2 = st.columns([1.3, 1])
             with u1:
                 st.write("##### Active Security Personnel")
-                st.dataframe(get_all_users(), use_container_width=True, hide_index=True)
+                st.dataframe(get_all_users(), width="stretch", hide_index=True)
                 st.write("##### 🗑️ Remove User")
                 del_u = st.text_input("Username to remove")
-                if st.button("Delete User", use_container_width=True) and del_u:
+                if st.button("Delete User", width="stretch") and del_u:
                     ok, msg = delete_user(del_u.strip())
                     if ok:
                         st.success(msg)
@@ -580,7 +892,7 @@ def render_soc_interface():
                     nn = st.text_input("Full Name *")
                     np = st.text_input("Password *", type="password")
                     nr = st.selectbox("Role", ["operator", "admin"])
-                    if st.form_submit_button("Create Account", use_container_width=True):
+                    if st.form_submit_button("Create Account", width="stretch"):
                         if nu and np and nn:
                             ok, msg = add_new_user(nu.strip(), np.strip(), nr, nn.strip())
                             if ok:
